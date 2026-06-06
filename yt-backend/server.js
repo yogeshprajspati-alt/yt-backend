@@ -5,11 +5,20 @@ import { Innertube } from 'youtubei.js';
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 app.use(cors({ origin: ALLOWED_ORIGIN, methods: ['GET'] }));
 
-// ── Piped instances ───────────────────────────────────────────────────────────
+// ── Invidious instances (most reliable, separate from Piped) ──────────────────
+const INVIDIOUS_INSTANCES = [
+  'https://invidious.snopyta.org',
+  'https://yewtu.be',
+  'https://invidious.kavin.rocks',
+  'https://inv.riverside.rocks',
+  'https://invidious.nerdvpn.de',
+  'https://invidious.lunar.icu',
+];
+
+// ── Piped instances (backup) ──────────────────────────────────────────────────
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://piped-api.garudalinux.org',
@@ -17,7 +26,7 @@ const PIPED_INSTANCES = [
   'https://pipedapi.tokhmi.xyz',
 ];
 
-// ── Innertube singleton ───────────────────────────────────────────────────────
+// ── Innertube singleton (search only) ────────────────────────────────────────
 let yt = null;
 let ytInitializing = false;
 let ytInitError = null;
@@ -32,7 +41,7 @@ async function getYT() {
     throw new Error('Innertube init in progress');
   }
   if (ytInitError && Date.now() - ytInitTime < YT_REINIT_COOLDOWN) {
-    throw new Error('Innertube cooling down after init failure');
+    throw new Error('Innertube cooling down');
   }
   ytInitializing = true;
   ytInitError = null;
@@ -42,8 +51,7 @@ async function getYT() {
     console.log('[yt-backend] Innertube initialized');
     return yt;
   } catch (err) {
-    yt = null;
-    ytInitError = err;
+    yt = null; ytInitError = err;
     console.error('[yt-backend] Innertube init failed:', err.message);
     throw err;
   } finally {
@@ -78,20 +86,16 @@ function setCache(key, data) {
 // ── Validation ────────────────────────────────────────────────────────────────
 const YT_ID_REGEX = /^[a-zA-Z0-9_-]{11}$/;
 const isValidYtId = id => typeof id === 'string' && YT_ID_REGEX.test(id);
-const sanitize    = (str, max = 200) => typeof str !== 'string' ? '' : str.trim().slice(0, max);
+const sanitize = (str, max = 200) => typeof str !== 'string' ? '' : str.trim().slice(0, max);
 
-// ── Normalize search result ───────────────────────────────────────────────────
 function normalizeYTSong(item) {
   try {
     const id = item.id;
     if (!isValidYtId(id)) return null;
     const title = sanitize(item.title?.text || item.title || '');
     if (!title) return null;
-    const artist = sanitize(
-      item.author?.name || item.artists?.map(a => a.name).join(', ') || 'Unknown'
-    );
-    const duration = typeof item.duration?.seconds === 'number'
-      ? Math.max(0, Math.floor(item.duration.seconds)) : 0;
+    const artist = sanitize(item.author?.name || item.artists?.map(a => a.name).join(', ') || 'Unknown');
+    const duration = typeof item.duration?.seconds === 'number' ? Math.max(0, Math.floor(item.duration.seconds)) : 0;
     const rawThumb = item.thumbnail?.[0]?.url || item.thumbnails?.[0]?.url;
     const cover = rawThumb || `https://i.ytimg.com/vi/${id}/hqdefault.jpg`;
     return { id: `yt-${id}`, ytId: id, title, artist, album: '', cover, duration, source: 'youtube' };
@@ -101,7 +105,7 @@ function normalizeYTSong(item) {
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const ipHits = new Map();
 const RATE_WINDOW = 60 * 1000;
-const RATE_LIMIT  = 60;
+const RATE_LIMIT = 60;
 
 function isRateLimited(ip) {
   const now = Date.now();
@@ -126,17 +130,14 @@ function asyncHandler(fn) {
   return (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(err => {
       console.error('[route error]', err.message);
-      if (err.message?.includes('Innertube') || err.message?.includes('session')) resetYT(err.message);
       if (!res.headersSent) res.status(500).json({ error: 'Internal server error', message: err.message });
     });
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SEARCH — same query par alternate video dhundna bhi handle karta hai
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Search ────────────────────────────────────────────────────────────────────
 app.get('/search', rateLimit, asyncHandler(async (req, res) => {
-  const q     = sanitize(req.query.q || '');
+  const q = sanitize(req.query.q || '');
   const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 50);
   if (!q) return res.status(400).json({ error: 'Query "q" is required' });
 
@@ -145,7 +146,7 @@ app.get('/search', rateLimit, asyncHandler(async (req, res) => {
   try {
     results = await youtube.music.search(q, { type: 'song' });
   } catch (err) {
-    resetYT('music.search failed: ' + err.message);
+    resetYT('search failed: ' + err.message);
     throw err;
   }
 
@@ -158,9 +159,36 @@ app.get('/search', rateLimit, asyncHandler(async (req, res) => {
   res.json({ success: true, count: songs.length, data: songs });
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
-// STREAM — Piped primary, Innertube fallback, alternate search fallback
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Stream — Invidious → Piped → Error ───────────────────────────────────────
+
+async function getStreamFromInvidious(ytId) {
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/api/v1/videos/${ytId}?fields=adaptiveFormats`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(10000),
+      });
+      console.log(`[invidious] ${instance} → ${res.status}`);
+      if (!res.ok) continue;
+
+      const data = await res.json();
+      if (data.error) { console.warn(`[invidious] error:`, data.error); continue; }
+
+      const audioFormats = (data.adaptiveFormats || [])
+        .filter(f => f.type?.startsWith('audio/') && f.url)
+        .sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0));
+
+      if (!audioFormats.length) continue;
+
+      const best = audioFormats[0];
+      console.log(`[invidious] Got stream from ${instance}`);
+      return { url: best.url, mimeType: best.type || null, bitrate: parseInt(best.bitrate) || null, via: 'invidious' };
+    } catch (err) {
+      console.warn(`[invidious] ${instance} failed:`, err.message);
+    }
+  }
+  return null;
+}
 
 async function getStreamFromPiped(ytId) {
   for (const instance of PIPED_INSTANCES) {
@@ -171,15 +199,13 @@ async function getStreamFromPiped(ytId) {
       });
       console.log(`[piped] ${instance} → ${res.status}`);
       if (!res.ok) continue;
-      const data = await res.json();
-      console.log(`[piped] ${instance} keys:`, Object.keys(data).join(', '));
 
-      // Check if Piped itself says video is unavailable
-      if (data.error) {
-        console.warn(`[piped] ${instance} error:`, data.error);
-        // Return the error type so we can handle it upstream
-        return { pipedError: data.error };
-      }
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch { console.warn(`[piped] ${instance} non-JSON response`); continue; }
+
+      if (data.error) { console.warn(`[piped] ${instance} error:`, data.error); continue; }
 
       const audioStreams = (data.audioStreams || [])
         .filter(s => s.url && s.bitrate)
@@ -188,6 +214,7 @@ async function getStreamFromPiped(ytId) {
       if (!audioStreams.length) continue;
 
       const best = audioStreams[0];
+      console.log(`[piped] Got stream from ${instance}`);
       return { url: best.url, mimeType: best.mimeType || null, bitrate: best.bitrate || null, via: 'piped' };
     } catch (err) {
       console.warn(`[piped] ${instance} failed:`, err.message);
@@ -196,136 +223,26 @@ async function getStreamFromPiped(ytId) {
   return null;
 }
 
-async function getStreamFromInnertube(ytId) {
-  const youtube = await getYT();
-  let info;
-  try {
-    info = await youtube.getBasicInfo(ytId, 'TV_EMBEDDED');
-  } catch (err) {
-    resetYT('getBasicInfo failed: ' + err.message);
-    throw err;
-  }
-
-  // Check playability status
-  const status = info?.playability_status;
-  if (status?.status === 'LOGIN_REQUIRED') return { blocked: true, reason: 'private' };
-  if (status?.status === 'UNPLAYABLE')     return { blocked: true, reason: 'geo_restricted' };
-  if (status?.status === 'ERROR')          return { blocked: true, reason: 'deleted' };
-
-  const formats = info?.streaming_data?.adaptive_formats || [];
-  const audioFormats = formats
-    .filter(f => f.has_audio && !f.has_video && f.url)
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-
-  const best = audioFormats[0];
-  if (!best?.url) return null;
-
-  return { url: best.url, mimeType: best.mime_type || null, bitrate: best.bitrate || null, via: 'innertube' };
-}
-
-// If original video is blocked, search for an alternate version of the same song
-async function findAlternateStream(originalYtId) {
-  console.log(`[stream] Searching alternate for ${originalYtId}...`);
-  const youtube = await getYT();
-
-  let videoInfo;
-  try {
-    videoInfo = await youtube.getBasicInfo(originalYtId);
-  } catch {
-    return null;
-  }
-
-  const title  = videoInfo?.basic_info?.title   || '';
-  const author = videoInfo?.basic_info?.author  || '';
-  if (!title) return null;
-
-  // Search for the same song — different upload
-  const query = `${title} ${author} audio`.trim();
-  let results;
-  try {
-    results = await youtube.music.search(query, { type: 'song' });
-  } catch {
-    return null;
-  }
-
-  const candidates = (results?.contents || [])
-    .flatMap(s => s?.contents || [])
-    .map(normalizeYTSong)
-    .filter(Boolean)
-    .filter(s => s.ytId !== originalYtId) // skip the blocked one
-    .slice(0, 5); // try up to 5 alternates
-
-  for (const candidate of candidates) {
-    console.log(`[stream] Trying alternate: ${candidate.ytId} — ${candidate.title}`);
-
-    // Try Piped first for each candidate
-    const pipedResult = await getStreamFromPiped(candidate.ytId);
-    if (pipedResult && pipedResult.url) {
-      return { ...pipedResult, alternateYtId: candidate.ytId, alternateTitle: candidate.title };
-    }
-
-    // Then Innertube
-    const innerResult = await getStreamFromInnertube(candidate.ytId);
-    if (innerResult && innerResult.url) {
-      return { ...innerResult, alternateYtId: candidate.ytId, alternateTitle: candidate.title };
-    }
-  }
-
-  return null; // no alternate found
-}
-
 app.get('/stream/:ytId', rateLimit, asyncHandler(async (req, res) => {
   const { ytId } = req.params;
   if (!isValidYtId(ytId)) return res.status(400).json({ error: 'Invalid YouTube video ID' });
 
-  // Cache hit
   const cached = getCached(ytId);
   if (cached) return res.json({ success: true, cached: true, ...cached });
 
-  // 1. Try Piped
-  let result = await getStreamFromPiped(ytId);
+  // 1. Invidious (most reliable on cloud IPs)
+  let result = await getStreamFromInvidious(ytId);
 
-  // Piped returned an error (private/geo/deleted) — skip straight to alternate
-  const pipedBlocked = result && result.pipedError;
-
-  if (!result || pipedBlocked) {
-    // 2. Try Innertube to get a proper block reason
-    console.warn(`[stream] Piped failed for ${ytId}, trying Innertube...`);
-    const innerResult = await getStreamFromInnertube(ytId);
-
-    if (innerResult?.blocked) {
-      // Video is confirmed blocked — search for an alternate
-      console.warn(`[stream] Video ${ytId} is ${innerResult.reason}, finding alternate...`);
-      const alternate = await findAlternateStream(ytId);
-
-      if (alternate) {
-        setCache(ytId, alternate);
-        return res.json({
-          success:   true,
-          cached:    false,
-          isAlternate: true,
-          reason:    innerResult.reason, // 'private' | 'geo_restricted' | 'deleted'
-          ...alternate,
-        });
-      }
-
-      // No alternate found at all
-      return res.status(404).json({
-        success: false,
-        error:   'Video unavailable and no alternate found',
-        reason:  innerResult.reason,
-      });
-    }
-
-    if (innerResult?.url) {
-      result = innerResult;
-    }
+  // 2. Piped fallback
+  if (!result) {
+    console.warn(`[stream] Invidious failed for ${ytId}, trying Piped...`);
+    result = await getStreamFromPiped(ytId);
   }
 
-  if (!result || !result.url) {
+  if (!result) {
     return res.status(404).json({
       success: false,
-      error:   'No audio stream found — video may be private, deleted, or geo-restricted',
+      error: 'No audio stream found — video may be private, deleted, or geo-restricted',
     });
   }
 
@@ -341,21 +258,17 @@ app.get('/health', (req, res) => {
     cacheSize: streamCache.size,
     uptime: Math.floor(process.uptime()),
     memory: process.memoryUsage().heapUsed,
-    pipedInstances: PIPED_INSTANCES.length,
   });
 });
 
-// ── 404 + global error ────────────────────────────────────────────────────────
 app.use((req, res) => res.status(404).json({ error: `Not found: ${req.method} ${req.path}` }));
 app.use((err, req, res, _next) => {
-  console.error('[express error]', err.message);
   if (!res.headersSent) res.status(500).json({ error: 'Internal server error', message: err.message });
 });
 
 process.on('uncaughtException',  err    => { console.error('[uncaughtException]', err);    resetYT('uncaughtException'); });
 process.on('unhandledRejection', reason => { console.error('[unhandledRejection]', reason); resetYT('unhandledRejection'); });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[yt-backend] Running on port ${PORT}`);
   getYT().catch(err => console.error('[yt-backend] Warm-up failed:', err.message));
