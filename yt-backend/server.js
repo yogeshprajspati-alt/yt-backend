@@ -167,10 +167,12 @@ async function getStreamFromPiped(ytId) {
     try {
       const res = await fetch(`${instance}/streams/${ytId}`, {
         headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
       });
-      if (!res.ok) { console.warn(`[piped] ${instance} → ${res.status}`); continue; }
+      console.log(`[piped] ${instance} → ${res.status}`);
+      if (!res.ok) continue;
       const data = await res.json();
+      console.log(`[piped] ${instance} keys:`, Object.keys(data).join(', '));
 
       // Check if Piped itself says video is unavailable
       if (data.error) {
@@ -198,7 +200,7 @@ async function getStreamFromInnertube(ytId) {
   const youtube = await getYT();
   let info;
   try {
-    info = await youtube.getBasicInfo(ytId, 'ANDROID');
+    info = await youtube.getBasicInfo(ytId, 'TV_EMBEDDED');
   } catch (err) {
     resetYT('getBasicInfo failed: ' + err.message);
     throw err;
